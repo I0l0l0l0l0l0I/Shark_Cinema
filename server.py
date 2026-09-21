@@ -5,6 +5,7 @@ import base64
 import asyncio
 import socketio
 import yt_dlp
+from urllib.parse import unquote, urljoin
 from aiohttp import web, ClientSession
 
 sio = socketio.AsyncServer(
@@ -110,6 +111,7 @@ def extract_clean_title(html):
         raw_t = re.sub(r'<[^>]+>', '', m.group(1)).strip()
         raw_t = re.sub(r'\s*смотреть онлайн.*', '', raw_t, flags=re.IGNORECASE).strip()
         raw_t = re.sub(r'\s*в HD.*', '', raw_t, flags=re.IGNORECASE).strip()
+        raw_t = re.sub(r'\s*на Kinogo.*', '', raw_t, flags=re.IGNORECASE).strip()
         return raw_t
     return "Кинофильм"
 
@@ -205,6 +207,44 @@ async def fetch_playerjs_playlist(session, pl_url):
             return playlist
     except Exception as e:
         print(f"[❌] Error reading Playerjs playlist: {e}")
+        return []
+
+async def parse_collaps_embed(session, embed_url, referer_url):
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Referer": referer_url
+        }
+        async with session.get(embed_url, headers=headers, timeout=12) as resp:
+            embed_html = await resp.text()
+
+        matches = re.findall(r'(https://dl\.showvid\.ws/x-px\?m=[^"\'\s<>]+)', embed_html)
+        if not matches:
+            matches = re.findall(r'https?://[^\s"\'<>]+\.m3u8[^\s"\'<>]*', embed_html)
+
+        playlist = []
+        seen_titles = {}
+
+        for idx, m in enumerate(matches):
+            clean_url = m.replace(r'\u0026', '&')
+            title_match = re.search(r'title=([^&]+)', clean_url)
+            if title_match:
+                raw_title = unquote(title_match.group(1).replace('+', ' ')).strip()
+            else:
+                raw_title = f"{idx + 1} Серия"
+
+            if raw_title in seen_titles:
+                seen_titles[raw_title] += 1
+                display_title = f"{raw_title} (версия {seen_titles[raw_title]})"
+            else:
+                seen_titles[raw_title] = 1
+                display_title = raw_title
+
+            playlist.append({"title": display_title, "url": clean_url})
+
+        return playlist
+    except Exception as e:
+        print(f"[❌] Error parsing Collaps embed: {e}")
         return []
 
 @sio.event
@@ -325,13 +365,12 @@ async def extract_magic(sid, data):
     if sid != room_state["owner_sid"]: return
     url = data.get("url", "").strip()
     
-    await sio.emit('server_log', {'type': 'INFO', 'msg': 'YouTube v8.1 Fix сканирует...', 'details': url}, to=sid)
+    await sio.emit('server_log', {'type': 'INFO', 'msg': 'Shark Cinema сканирует источник...', 'details': url}, to=sid)
 
-    # 🔴 ОБРАБОТКА YOUTUBE ССЫЛОК
+    # 1. YOUTUBE ССЫЛКИ
     if "youtube.com" in url or "youtu.be" in url:
         try:
-            await sio.emit('server_log', {'type': 'INFO', 'msg': 'Запуск yt-dlp для YouTube (Мобильный клиент)...'}, to=sid)
-            
+            await sio.emit('server_log', {'type': 'INFO', 'msg': 'Запуск yt-dlp для YouTube...'}, to=sid)
             loop = asyncio.get_event_loop()
             yt_info = await loop.run_in_executor(None, extract_youtube_stream, url)
             
@@ -349,7 +388,6 @@ async def extract_magic(sid, data):
                 save_state_to_disk()
                 
                 await sio.emit('server_log', {'type': 'SUCCESS', 'msg': f'YouTube Извлечен: {yt_title}'}, to=sid)
-                
                 await sio.emit('player_command', {
                     'action': 'update_playlist', 
                     'playlist': yt_playlist, 
@@ -362,32 +400,62 @@ async def extract_magic(sid, data):
                 })
                 return
         except Exception as yt_err:
-            await sio.emit('server_log', {'type': 'ERROR', 'msg': 'Ошибка извлечения YouTube!', 'details': str(yt_err)}, to=sid)
+            await sio.emit('server_log', {'type': 'ERROR', 'msg': 'Ошибка YouTube!', 'details': str(yt_err)}, to=sid)
             return
 
-    # 🌐 ОБРАБОТКА KINOVIBE ССЫЛОК
+    # 2. KINOVIBE И KINOGO / COLLAPS ССЫЛКИ
     try:
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-            "Referer": "https://kinovibe.cc/"
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Referer": "https://kinovibe.cc/" if "kinovibe" in url else "https://mov.kinogo1.biz/"
         }
 
         async with ClientSession(headers=headers, cookies=kv_cookies) as session:
             async with session.get(url, timeout=12) as resp:
                 html = await resp.text()
-                
                 media_title = extract_clean_title(html)
-                room_state["media_title"] = media_title
-                
+
+                # --- ПРОВЕРКА НА KINOGO / COLLAPS BALANCER ---
+                iframe_match = re.search(r'<iframe[^>]+src=["\']([^"\']+)["\']', html, re.IGNORECASE)
+                if "ortified.ws" in url or "collaps" in url or (iframe_match and ("ortified.ws" in iframe_match.group(1) or "collaps" in iframe_match.group(1))):
+                    embed_url = url if ("ortified.ws" in url or "collaps" in url) else iframe_match.group(1)
+                    if embed_url.startswith('//'): embed_url = 'https:' + embed_url
+                    elif embed_url.startswith('/'): embed_url = urljoin(url, embed_url)
+
+                    await sio.emit('server_log', {'type': 'INFO', 'msg': 'Найден плеер Kinogo/Collaps! Сканирую серии...', 'details': embed_url}, to=sid)
+                    playlist = await parse_collaps_embed(session, embed_url, url)
+
+                    if playlist:
+                        room_state["playlist"] = playlist
+                        room_state["current_ep_index"] = 0
+                        room_state["mode"] = "video"
+                        room_state["current_url"] = playlist[0]["url"]
+                        room_state["media_title"] = media_title or "Винченцо"
+
+                        save_state_to_disk()
+
+                        await sio.emit('server_log', {'type': 'SUCCESS', 'msg': f'Найдено серий Kinogo: {len(playlist)}!', 'details': f'Запускаю: {room_state["media_title"]}'}, to=sid)
+                        await sio.emit('player_command', {
+                            'action': 'update_playlist', 
+                            'playlist': playlist, 
+                            'currentIndex': 0,
+                            'media_title': room_state["media_title"]
+                        })
+                        await sio.emit('player_command', {
+                            'action': 'load_video', 
+                            'url': playlist[0]["url"]
+                        })
+                        return
+
+                # --- СТАНДАРТНАЯ ЛОГИКА KINOVIBE (Playerjs) ---
                 match_file = re.search(r'file\s*:\s*["\']([^"\'\s]+)["\']', html, re.IGNORECASE)
-                
                 if match_file:
                     found_path = match_file.group(1).strip()
                     
                     if ".txt" in found_path or ".json" in found_path:
                         pl_url = found_path if found_path.startswith('http') else ("https:" + found_path if found_path.startswith('//') else "https://kinovibe.cc" + (found_path if found_path.startswith('/') else '/' + found_path))
                         
-                        await sio.emit('server_log', {'type': 'SUCCESS', 'msg': 'Найден плейлист!', 'details': pl_url}, to=sid)
+                        await sio.emit('server_log', {'type': 'SUCCESS', 'msg': 'Найден плейлист Kinovibe!', 'details': pl_url}, to=sid)
                         playlist = await fetch_playerjs_playlist(session, pl_url)
                         
                         if playlist:
@@ -395,11 +463,11 @@ async def extract_magic(sid, data):
                             room_state["current_ep_index"] = 0
                             room_state["mode"] = "video"
                             room_state["current_url"] = playlist[0]["url"]
+                            room_state["media_title"] = media_title
                             
                             save_state_to_disk()
                             
                             await sio.emit('server_log', {'type': 'SUCCESS', 'msg': f'Загружено серий: {len(playlist)}!', 'details': f'Запускаю: {media_title}'}, to=sid)
-                            
                             await sio.emit('player_command', {
                                 'action': 'update_playlist', 
                                 'playlist': playlist, 
@@ -420,11 +488,11 @@ async def extract_magic(sid, data):
                         room_state["current_ep_index"] = 0
                         room_state["mode"] = "video"
                         room_state["current_url"] = movie_url
+                        room_state["media_title"] = media_title
                         
                         save_state_to_disk()
                         
                         await sio.emit('server_log', {'type': 'SUCCESS', 'msg': f'Найден Фильм: {media_title}', 'details': movie_url}, to=sid)
-                        
                         await sio.emit('player_command', {
                             'action': 'update_playlist', 
                             'playlist': movie_playlist, 
@@ -437,7 +505,7 @@ async def extract_magic(sid, data):
                         })
                         return
 
-                await sio.emit('server_log', {'type': 'ERROR', 'msg': 'Медиапоток не найден', 'details': 'Проверь ссылку.'}, to=sid)
+                await sio.emit('server_log', {'type': 'ERROR', 'msg': 'Медиапоток не найден на странице', 'details': 'Проверь ссылку.'}, to=sid)
 
     except Exception as e:
         await sio.emit('server_log', {'type': 'ERROR', 'msg': 'Ошибка сервера!', 'details': str(e)}, to=sid)
