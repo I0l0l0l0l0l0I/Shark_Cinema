@@ -227,6 +227,8 @@ async def parse_collaps_embed(session, embed_url, referer_url):
 
         for idx, m in enumerate(matches):
             clean_url = m.replace(r'\u0026', '&')
+            
+            # Название серии
             title_match = re.search(r'title=([^&]+)', clean_url)
             if title_match:
                 raw_title = unquote(title_match.group(1).replace('+', ' ')).strip()
@@ -240,7 +242,14 @@ async def parse_collaps_embed(session, embed_url, referer_url):
                 seen_titles[raw_title] = 1
                 display_title = raw_title
 
-            playlist.append({"title": display_title, "url": clean_url})
+            # 🔥 РАЗВОРАЧИВАЕМ ПРЯМУЮ CDN ССЫЛКУ ИЗ ПАРАМЕТРА m= (обход CORS ошибки)
+            m_param = re.search(r'[?&]m=([^&]+)', clean_url)
+            if m_param:
+                stream_url = unquote(m_param.group(1))
+            else:
+                stream_url = clean_url
+
+            playlist.append({"title": display_title, "url": stream_url})
 
         return playlist
     except Exception as e:
