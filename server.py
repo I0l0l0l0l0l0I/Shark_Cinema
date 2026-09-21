@@ -5,7 +5,7 @@ import base64
 import asyncio
 import socketio
 import yt_dlp
-from urllib.parse import unquote, urljoin
+from urllib.parse import unquote, urljoin, quote
 from aiohttp import web, ClientSession
 
 sio = socketio.AsyncServer(
@@ -17,6 +17,7 @@ app = web.Application()
 sio.attach(app)
 
 OWNER_PIN = os.getenv("OWNER_PIN", "18349276")
+PUBLIC_HOST = "https://agile-enrich-grumpily.ngrok-free.dev"
 
 STATE_FILE = "room_state.json"
 COOKIES_FILE = "kinovibe_cookies.json"
@@ -111,18 +112,16 @@ def extract_clean_title(html):
         raw_t = re.sub(r'<[^>]+>', '', m.group(1)).strip()
         raw_t = re.sub(r'\s*смотреть онлайн.*', '', raw_t, flags=re.IGNORECASE).strip()
         raw_t = re.sub(r'\s*в HD.*', '', raw_t, flags=re.IGNORECASE).strip()
-        raw_t = re.sub(r'\s*на Kinogo.*', '', raw_t, flags=re.IGNORECASE).strip()
         raw_t = re.sub(r'\s*скачать на телефон.*', '', raw_t, flags=re.IGNORECASE).strip()
         return raw_t
     return "Сериал"
 
 async def get_anwap_direct_mp4(session, down_url, headers):
-    """Извлекает прямой CDN URL MP4 файла из страницы серии Anwap"""
+    """Заходит на страницу серии Anwap и забирает прямой URL из редиректа"""
     try:
         async with session.get(down_url, headers=headers, timeout=10) as resp:
             html = await resp.text()
 
-        # Ищем кнопку скачивания MP4 (лучшее качество bmp4 -> mp4 -> 3gp)
         load_path = None
         for q in ['bmp4', 'mp4', '3gp']:
             m = re.search(rf'href=["\'](/serials/load/{q}/[^"\'\s]+)["\']', html, re.IGNORECASE)
@@ -140,50 +139,60 @@ async def get_anwap_direct_mp4(session, down_url, headers):
         load_url = urljoin("https://m.anwap.media", load_path)
         load_headers = {**headers, "Referer": down_url}
 
-        # Получаем прямой адрес из редиректа Location
         async with session.get(load_url, headers=load_headers, allow_redirects=False, timeout=10) as r:
             if r.status in (301, 302, 303, 307) and 'Location' in r.headers:
                 return r.headers['Location']
             return str(r.url)
     except Exception as e:
-        print(f"[❌] Ошибка извлечения Anwap MP4: {e}")
+        print(f"[❌] Ошибка Anwap: {e}")
         return None
 
+# 🛡️ ПРОКСИ-МОДУЛЬ: ПЕРЕДАЁТ ВИДЕО С IP СЕРВЕРА НА ЛЮБЫЕ ТЕЛЕФОНЫ И АЙФОНЫ
 async def proxy_video(request):
     target_url = request.query.get("url")
-    if not target_url: return web.Response(status=400, text="Missing url")
+    if not target_url:
+        return web.Response(status=400, text="Missing url")
 
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Referer": "https://kinovibe.cc/",
-        "Origin": "https://kinovibe.cc"
+    target_url = unquote(target_url)
+
+    req_headers = {
+        "User-Agent": "Mozilla/5.0 (Linux; Android 10; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
     }
 
+    if "anwap" in target_url:
+        req_headers["Referer"] = "https://m.anwap.media/"
+    elif "kinovibe" in target_url:
+        req_headers["Referer"] = "https://kinovibe.cc/"
+
     range_header = request.headers.get("Range")
-    if range_header: headers["Range"] = range_header
+    if range_header:
+        req_headers["Range"] = range_header
 
     try:
         async with ClientSession() as session:
-            async with session.get(target_url, headers=headers, allow_redirects=True) as resp:
-                proxy_resp = web.StreamResponse(
-                    status=resp.status,
-                    headers={
-                        "Content-Type": resp.headers.get("Content-Type", "video/mp4"),
-                        "Access-Control-Allow-Origin": "*",
-                        "Accept-Ranges": resp.headers.get("Accept-Ranges", "bytes"),
-                        "Content-Length": resp.headers.get("Content-Length", ""),
-                        "Content-Range": resp.headers.get("Content-Range", "")
-                    }
-                )
-                proxy_resp.headers = {k: v for k, v in proxy_resp.headers.items() if v}
+            async with session.get(target_url, headers=req_headers, allow_redirects=True) as resp:
+                resp_headers = {
+                    "Content-Type": resp.headers.get("Content-Type", "video/mp4"),
+                    "Access-Control-Allow-Origin": "*",
+                    "Accept-Ranges": "bytes"
+                }
+                if "Content-Length" in resp.headers:
+                    resp_headers["Content-Length"] = resp.headers["Content-Length"]
+                if "Content-Range" in resp.headers:
+                    resp_headers["Content-Range"] = resp.headers["Content-Range"]
+
+                proxy_resp = web.StreamResponse(status=resp.status, headers=resp_headers)
                 await proxy_resp.prepare(request)
-                
+
                 async for chunk in resp.content.iter_chunked(64 * 1024):
                     await proxy_resp.write(chunk)
 
                 await proxy_resp.write_eof()
                 return proxy_resp
+    except (ConnectionResetError, asyncio.CancelledError):
+        pass
     except Exception as e:
+        print(f"[❌] Ошибка прокси: {e}")
         return web.Response(status=500, text=str(e))
 
 app.router.add_get('/proxy_video', proxy_video)
@@ -197,7 +206,6 @@ async def fetch_playerjs_playlist(session, pl_url):
             except Exception: text = raw_bytes.decode('cp1251', errors='ignore')
 
             clean_text = re.sub(r'[\x00-\x1f\x7f-\x9f\ufeff]', '', text).strip()
-
             if not clean_text.startswith('[') and not clean_text.startswith('{'):
                 b64_clean = re.sub(r'^#[0-9a-zA-Z]+', '', clean_text)
                 b64_clean = re.sub(r'[\r\n\s]', '', b64_clean)
@@ -322,14 +330,15 @@ async def switch_episode(sid, data):
         room_state["current_ep_index"] = idx
         ep = room_state["playlist"][idx]
 
-        # ⚡ Если это серия с Anwap, которую мы ещё не разрешали в прямой MP4:
-        if "anwap.media/serials/down/" in ep["url"]:
-            await sio.emit('server_log', {'type': 'INFO', 'msg': f'Загрузка потока: {ep["title"]}...'}, to=sid)
+        # Если это Anwap, разрешаем серию и оборачиваем в прокси
+        if ep.get("down_url") and ("/proxy_video" not in ep.get("url", "")):
+            await sio.emit('server_log', {'type': 'INFO', 'msg': f'Загрузка через серверный прокси: {ep["title"]}...'}, to=sid)
             headers = {"User-Agent": "Mozilla/5.0 (Linux; Android 10; Mobile)", "Referer": "https://m.anwap.media/"}
             async with ClientSession() as session:
-                direct_mp4 = await get_anwap_direct_mp4(session, ep["url"], headers)
+                direct_mp4 = await get_anwap_direct_mp4(session, ep["down_url"], headers)
                 if direct_mp4:
-                    ep["url"] = direct_mp4
+                    proxied_url = f"{PUBLIC_HOST}/proxy_video?url={quote(direct_mp4, safe='')}"
+                    ep["url"] = proxied_url
 
         room_state["mode"] = "video"
         room_state["current_url"] = ep["url"]
@@ -375,13 +384,12 @@ async def extract_magic(sid, data):
             await sio.emit('server_log', {'type': 'ERROR', 'msg': f'Ошибка YouTube: {e}'}, to=sid)
             return
 
-    # 2. 🚀 ANWAP (ПРЯМЫЕ MP4 ФАЙЛЫ)
+    # 2. 🚀 ANWAP (ЧЕРЕЗ СЕРВЕРНЫЙ ПРОКСИ ДЛЯ ВСЕХ УСТРОЙСТВ И АЙФОНОВ)
     if "anwap" in url:
         try:
             headers = {"User-Agent": "Mozilla/5.0 (Linux; Android 10; Mobile)", "Referer": "https://m.anwap.media/"}
             async with ClientSession() as session:
                 season_url = url
-                # Если вставили ссылку на серию, сначала заходим на неё и ищем ссылку на сезон
                 if "/serials/down/" in url:
                     async with session.get(url, headers=headers, timeout=10) as r:
                         ep_html = await r.text()
@@ -389,16 +397,13 @@ async def extract_magic(sid, data):
                         if season_m:
                             season_url = urljoin("https://m.anwap.media", season_m.group(1))
 
-                # Скачиваем страницу сезона (и пагинацию, если есть)
                 async with session.get(season_url, headers=headers, timeout=10) as r:
                     season_html = await r.text()
 
                 media_title = extract_clean_title(season_html) or "Винченцо (Сериал)"
 
-                # Собираем все серии со страницы сезона
                 ep_links = re.findall(r'<a[^>]+href=["\'](/serials/down/\d+)["\'][^>]*>(.*?)</a>', season_html, re.IGNORECASE)
                 
-                # Проверяем пагинацию (страница 2, если серий больше 10)
                 page2_m = re.search(r'href=["\'](/serials/s\d+[?&](?:p|page)=2)["\']', season_html)
                 if page2_m:
                     p2_url = urljoin("https://m.anwap.media", page2_m.group(1))
@@ -413,38 +418,37 @@ async def extract_magic(sid, data):
                     await sio.emit('server_log', {'type': 'ERROR', 'msg': 'Серии на Anwap не найдены!'}, to=sid)
                     return
 
-                # Формируем плейлист
                 playlist = []
                 seen = set()
                 for link, raw_name in ep_links:
                     full_link = urljoin("https://m.anwap.media", link)
                     if full_link in seen: continue
                     seen.add(full_link)
-                    
                     clean_name = re.sub(r'<[^>]+>', '', raw_name).strip()
-                    # Красиво форматируем имя серии (например, "1 Серия")
                     num_m = re.search(r'(\d+)\s*серия', clean_name, re.IGNORECASE)
                     display_name = f"{num_m.group(1)} Серия" if num_m else clean_name
-                    playlist.append({"title": display_name, "url": full_link})
+                    playlist.append({"title": display_name, "down_url": full_link, "url": ""})
 
-                await sio.emit('server_log', {'type': 'INFO', 'msg': f'Найдено {len(playlist)} серий Anwap! Получаю первую серию...'}, to=sid)
+                await sio.emit('server_log', {'type': 'INFO', 'msg': f'Найдено {len(playlist)} серий! Подключаю серверный прокси...'}, to=sid)
 
-                # Мгновенно разрешаем прямую ссылку на 1-ю серию
-                first_mp4 = await get_anwap_direct_mp4(session, playlist[0]["url"], headers)
+                # Получаем прямой адрес первой серии
+                first_mp4 = await get_anwap_direct_mp4(session, playlist[0]["down_url"], headers)
                 if not first_mp4:
                     await sio.emit('server_log', {'type': 'ERROR', 'msg': 'Не удалось получить MP4 первой серии'}, to=sid)
                     return
 
-                playlist[0]["url"] = first_mp4
+                # 🔥 ПУСКАЕМ ЧЕРЕЗ СЕРВЕРНЫЙ ПРОКСИ (АЙФОН ПОЛУЧИТ ПОЛНЫЙ ДОСТУП)
+                proxied_url = f"{PUBLIC_HOST}/proxy_video?url={quote(first_mp4, safe='')}"
+                playlist[0]["url"] = proxied_url
 
                 room_state["playlist"] = playlist
                 room_state["current_ep_index"] = 0
                 room_state["mode"] = "video"
-                room_state["current_url"] = first_mp4
+                room_state["current_url"] = proxied_url
                 room_state["media_title"] = media_title
                 save_state_to_disk()
 
-                await sio.emit('server_log', {'type': 'SUCCESS', 'msg': f'🔥 Чистый MP4 готов! Запускаю {media_title}'}, to=sid)
+                await sio.emit('server_log', {'type': 'SUCCESS', 'msg': f'🛡️ Прокси активирован! Запускаю {media_title}'}, to=sid)
                 await sio.emit('player_command', {
                     'action': 'update_playlist', 
                     'playlist': playlist, 
@@ -453,11 +457,11 @@ async def extract_magic(sid, data):
                 })
                 await sio.emit('player_command', {
                     'action': 'load_video', 
-                    'url': first_mp4
+                    'url': proxied_url
                 })
                 return
         except Exception as e:
-            await sio.emit('server_log', {'type': 'ERROR', 'msg': f'Ошибка парсинга Anwap: {e}'}, to=sid)
+            await sio.emit('server_log', {'type': 'ERROR', 'msg': f'Ошибка Anwap: {e}'}, to=sid)
             return
 
     # 3. 🌐 KINOVIBE (СТАНДАРТ)
