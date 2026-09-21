@@ -112,8 +112,42 @@ def extract_clean_title(html):
         raw_t = re.sub(r'\s*смотреть онлайн.*', '', raw_t, flags=re.IGNORECASE).strip()
         raw_t = re.sub(r'\s*в HD.*', '', raw_t, flags=re.IGNORECASE).strip()
         raw_t = re.sub(r'\s*на Kinogo.*', '', raw_t, flags=re.IGNORECASE).strip()
+        raw_t = re.sub(r'\s*скачать на телефон.*', '', raw_t, flags=re.IGNORECASE).strip()
         return raw_t
-    return "Кинофильм"
+    return "Сериал"
+
+async def get_anwap_direct_mp4(session, down_url, headers):
+    """Извлекает прямой CDN URL MP4 файла из страницы серии Anwap"""
+    try:
+        async with session.get(down_url, headers=headers, timeout=10) as resp:
+            html = await resp.text()
+
+        # Ищем кнопку скачивания MP4 (лучшее качество bmp4 -> mp4 -> 3gp)
+        load_path = None
+        for q in ['bmp4', 'mp4', '3gp']:
+            m = re.search(rf'href=["\'](/serials/load/{q}/[^"\'\s]+)["\']', html, re.IGNORECASE)
+            if m:
+                load_path = m.group(1)
+                break
+
+        if not load_path:
+            m = re.search(r'href=["\'](/serials/load/[^"\'\s]+)["\']', html, re.IGNORECASE)
+            if m: load_path = m.group(1)
+
+        if not load_path:
+            return None
+
+        load_url = urljoin("https://m.anwap.media", load_path)
+        load_headers = {**headers, "Referer": down_url}
+
+        # Получаем прямой адрес из редиректа Location
+        async with session.get(load_url, headers=load_headers, allow_redirects=False, timeout=10) as r:
+            if r.status in (301, 302, 303, 307) and 'Location' in r.headers:
+                return r.headers['Location']
+            return str(r.url)
+    except Exception as e:
+        print(f"[❌] Ошибка извлечения Anwap MP4: {e}")
+        return None
 
 async def proxy_video(request):
     target_url = request.query.get("url")
@@ -159,11 +193,8 @@ async def fetch_playerjs_playlist(session, pl_url):
         headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://kinovibe.cc/"}
         async with session.get(pl_url, headers=headers, cookies=kv_cookies, timeout=8) as resp:
             raw_bytes = await resp.read()
-            
-            try:
-                text = raw_bytes.decode('utf-8-sig', errors='ignore')
-            except Exception:
-                text = raw_bytes.decode('cp1251', errors='ignore')
+            try: text = raw_bytes.decode('utf-8-sig', errors='ignore')
+            except Exception: text = raw_bytes.decode('cp1251', errors='ignore')
 
             clean_text = re.sub(r'[\x00-\x1f\x7f-\x9f\ufeff]', '', text).strip()
 
@@ -176,7 +207,6 @@ async def fetch_playerjs_playlist(session, pl_url):
                 except Exception: pass
 
             playlist = []
-
             try:
                 data = json.loads(clean_text)
                 raw_list = data.get("playlist", []) if isinstance(data, dict) else data
@@ -185,16 +215,13 @@ async def fetch_playerjs_playlist(session, pl_url):
                         raw_comment = item.get("comment", "")
                         clean_title = re.sub(r'<[^>]+>', ' ', raw_comment)
                         clean_title = re.sub(r'[^\w\s\d\[\]\(\)\-\.]', '', clean_title).strip()
-                        if not clean_title:
-                            clean_title = f"{len(playlist)+1} Серия"
+                        if not clean_title: clean_title = f"{len(playlist)+1} Серия"
                         playlist.append({"title": clean_title, "url": item["file"]})
-            except Exception as json_err:
-                print(f"[⚠️] JSON parse failed: {json_err}")
+            except Exception: pass
 
             if not playlist:
                 entries = re.findall(r'"file"\s*:\s*"([^"]+)"', text)
                 comments = re.findall(r'"comment"\s*:\s*"([^"]+)"', text)
-                
                 for idx, file_url in enumerate(entries):
                     title = f"{idx+1} Серия"
                     if idx < len(comments):
@@ -207,53 +234,6 @@ async def fetch_playerjs_playlist(session, pl_url):
             return playlist
     except Exception as e:
         print(f"[❌] Error reading Playerjs playlist: {e}")
-        return []
-
-async def parse_collaps_embed(session, embed_url, referer_url):
-    try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Referer": referer_url
-        }
-        async with session.get(embed_url, headers=headers, timeout=12) as resp:
-            embed_html = await resp.text()
-
-        matches = re.findall(r'(https://dl\.showvid\.ws/x-px\?m=[^"\'\s<>]+)', embed_html)
-        if not matches:
-            matches = re.findall(r'https?://[^\s"\'<>]+\.m3u8[^\s"\'<>]*', embed_html)
-
-        playlist = []
-        seen_titles = {}
-
-        for idx, m in enumerate(matches):
-            clean_url = m.replace(r'\u0026', '&')
-            
-            # Название серии
-            title_match = re.search(r'title=([^&]+)', clean_url)
-            if title_match:
-                raw_title = unquote(title_match.group(1).replace('+', ' ')).strip()
-            else:
-                raw_title = f"{idx + 1} Серия"
-
-            if raw_title in seen_titles:
-                seen_titles[raw_title] += 1
-                display_title = f"{raw_title} (версия {seen_titles[raw_title]})"
-            else:
-                seen_titles[raw_title] = 1
-                display_title = raw_title
-
-            # 🔥 РАЗВОРАЧИВАЕМ ПРЯМУЮ CDN ССЫЛКУ ИЗ ПАРАМЕТРА m= (обход CORS ошибки)
-            m_param = re.search(r'[?&]m=([^&]+)', clean_url)
-            if m_param:
-                stream_url = unquote(m_param.group(1))
-            else:
-                stream_url = clean_url
-
-            playlist.append({"title": display_title, "url": stream_url})
-
-        return playlist
-    except Exception as e:
-        print(f"[❌] Error parsing Collaps embed: {e}")
         return []
 
 @sio.event
@@ -273,11 +253,9 @@ async def auth_owner(sid, data):
         room_state["owner_sid"] = sid
         print(f"[👑] Owner authenticated: {sid}")
         await sio.emit('auth_result', {'success': True}, to=sid)
-        
         if room_state["mode"] == "video" and room_state["connected_count"] > 1:
             await sio.emit('request_guest_time_for_owner', skip_sid=sid)
     else:
-        print(f"[❌] Owner auth failed: '{pin}' vs '{OWNER_PIN}'")
         await sio.emit('auth_result', {'success': False}, to=sid)
 
 @sio.event
@@ -289,30 +267,20 @@ async def guest_time_report(sid, data):
 async def kinovibe_login(sid, data):
     global kv_cookies
     if sid != room_state["owner_sid"]: return
-    
     username = data.get("login")
     password = data.get("password")
-    
     headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://kinovibe.cc/"}
-    payload = {
-        "login_name": username,
-        "login_password": password,
-        "login": "submit"
-    }
-    
+    payload = {"login_name": username, "login_password": password, "login": "submit"}
     try:
         async with ClientSession() as session:
             async with session.post("https://kinovibe.cc/index.php?subaction=dologin", data=payload, headers=headers) as resp:
-                cookies_dict = {}
-                for cookie in session.cookie_jar:
-                    cookies_dict[cookie.key] = cookie.value
-                
+                cookies_dict = {c.key: c.value for c in session.cookie_jar}
                 if "dle_user_id" in cookies_dict or "dle_password" in cookies_dict:
                     kv_cookies = cookies_dict
                     save_cookies_to_disk(cookies_dict)
                     await sio.emit('kinovibe_auth_result', {'success': True, 'msg': 'Успешный вход! HD аккаунт активен.'}, to=sid)
                 else:
-                    await sio.emit('kinovibe_auth_result', {'success': False, 'msg': 'Неверный логин или пароль Kinovibe!'}, to=sid)
+                    await sio.emit('kinovibe_auth_result', {'success': False, 'msg': 'Неверный логин или пароль!'}, to=sid)
     except Exception as e:
         await sio.emit('kinovibe_auth_result', {'success': False, 'msg': f'Ошибка сети: {str(e)}'}, to=sid)
 
@@ -353,11 +321,20 @@ async def switch_episode(sid, data):
     if 0 <= idx < len(room_state["playlist"]):
         room_state["current_ep_index"] = idx
         ep = room_state["playlist"][idx]
+
+        # ⚡ Если это серия с Anwap, которую мы ещё не разрешали в прямой MP4:
+        if "anwap.media/serials/down/" in ep["url"]:
+            await sio.emit('server_log', {'type': 'INFO', 'msg': f'Загрузка потока: {ep["title"]}...'}, to=sid)
+            headers = {"User-Agent": "Mozilla/5.0 (Linux; Android 10; Mobile)", "Referer": "https://m.anwap.media/"}
+            async with ClientSession() as session:
+                direct_mp4 = await get_anwap_direct_mp4(session, ep["url"], headers)
+                if direct_mp4:
+                    ep["url"] = direct_mp4
+
         room_state["mode"] = "video"
         room_state["current_url"] = ep["url"]
-        
         save_state_to_disk()
-        
+
         await sio.emit('player_command', {
             'action': 'update_playlist', 
             'playlist': room_state["playlist"], 
@@ -373,19 +350,16 @@ async def switch_episode(sid, data):
 async def extract_magic(sid, data):
     if sid != room_state["owner_sid"]: return
     url = data.get("url", "").strip()
-    
+
     await sio.emit('server_log', {'type': 'INFO', 'msg': 'Shark Cinema сканирует источник...', 'details': url}, to=sid)
 
-    # 1. YOUTUBE ССЫЛКИ
+    # 1. 🎬 YOUTUBE
     if "youtube.com" in url or "youtu.be" in url:
         try:
-            await sio.emit('server_log', {'type': 'INFO', 'msg': 'Запуск yt-dlp для YouTube...'}, to=sid)
             loop = asyncio.get_event_loop()
             yt_info = await loop.run_in_executor(None, extract_youtube_stream, url)
-            
             yt_title = yt_info.get("title", "YouTube Видео")
             yt_stream_url = yt_info.get("url")
-            
             if yt_stream_url:
                 yt_playlist = [{"title": "YouTube (Смотреть)", "url": yt_stream_url}]
                 room_state["playlist"] = yt_playlist
@@ -393,129 +367,137 @@ async def extract_magic(sid, data):
                 room_state["mode"] = "video"
                 room_state["current_url"] = yt_stream_url
                 room_state["media_title"] = yt_title
-                
                 save_state_to_disk()
+                await sio.emit('player_command', {'action': 'update_playlist', 'playlist': yt_playlist, 'currentIndex': 0, 'media_title': yt_title})
+                await sio.emit('player_command', {'action': 'load_video', 'url': yt_stream_url})
+                return
+        except Exception as e:
+            await sio.emit('server_log', {'type': 'ERROR', 'msg': f'Ошибка YouTube: {e}'}, to=sid)
+            return
+
+    # 2. 🚀 ANWAP (ПРЯМЫЕ MP4 ФАЙЛЫ)
+    if "anwap" in url:
+        try:
+            headers = {"User-Agent": "Mozilla/5.0 (Linux; Android 10; Mobile)", "Referer": "https://m.anwap.media/"}
+            async with ClientSession() as session:
+                season_url = url
+                # Если вставили ссылку на серию, сначала заходим на неё и ищем ссылку на сезон
+                if "/serials/down/" in url:
+                    async with session.get(url, headers=headers, timeout=10) as r:
+                        ep_html = await r.text()
+                        season_m = re.search(r'href=["\'](/serials/s\d+)["\']', ep_html)
+                        if season_m:
+                            season_url = urljoin("https://m.anwap.media", season_m.group(1))
+
+                # Скачиваем страницу сезона (и пагинацию, если есть)
+                async with session.get(season_url, headers=headers, timeout=10) as r:
+                    season_html = await r.text()
+
+                media_title = extract_clean_title(season_html) or "Винченцо (Сериал)"
+
+                # Собираем все серии со страницы сезона
+                ep_links = re.findall(r'<a[^>]+href=["\'](/serials/down/\d+)["\'][^>]*>(.*?)</a>', season_html, re.IGNORECASE)
                 
-                await sio.emit('server_log', {'type': 'SUCCESS', 'msg': f'YouTube Извлечен: {yt_title}'}, to=sid)
+                # Проверяем пагинацию (страница 2, если серий больше 10)
+                page2_m = re.search(r'href=["\'](/serials/s\d+[?&](?:p|page)=2)["\']', season_html)
+                if page2_m:
+                    p2_url = urljoin("https://m.anwap.media", page2_m.group(1))
+                    async with session.get(p2_url, headers=headers, timeout=10) as r2:
+                        p2_html = await r2.text()
+                        ep_links += re.findall(r'<a[^>]+href=["\'](/serials/down/\d+)["\'][^>]*>(.*?)</a>', p2_html, re.IGNORECASE)
+
+                if not ep_links and "/serials/down/" in url:
+                    ep_links = [(url.replace("https://m.anwap.media", ""), "1 Серия")]
+
+                if not ep_links:
+                    await sio.emit('server_log', {'type': 'ERROR', 'msg': 'Серии на Anwap не найдены!'}, to=sid)
+                    return
+
+                # Формируем плейлист
+                playlist = []
+                seen = set()
+                for link, raw_name in ep_links:
+                    full_link = urljoin("https://m.anwap.media", link)
+                    if full_link in seen: continue
+                    seen.add(full_link)
+                    
+                    clean_name = re.sub(r'<[^>]+>', '', raw_name).strip()
+                    # Красиво форматируем имя серии (например, "1 Серия")
+                    num_m = re.search(r'(\d+)\s*серия', clean_name, re.IGNORECASE)
+                    display_name = f"{num_m.group(1)} Серия" if num_m else clean_name
+                    playlist.append({"title": display_name, "url": full_link})
+
+                await sio.emit('server_log', {'type': 'INFO', 'msg': f'Найдено {len(playlist)} серий Anwap! Получаю первую серию...'}, to=sid)
+
+                # Мгновенно разрешаем прямую ссылку на 1-ю серию
+                first_mp4 = await get_anwap_direct_mp4(session, playlist[0]["url"], headers)
+                if not first_mp4:
+                    await sio.emit('server_log', {'type': 'ERROR', 'msg': 'Не удалось получить MP4 первой серии'}, to=sid)
+                    return
+
+                playlist[0]["url"] = first_mp4
+
+                room_state["playlist"] = playlist
+                room_state["current_ep_index"] = 0
+                room_state["mode"] = "video"
+                room_state["current_url"] = first_mp4
+                room_state["media_title"] = media_title
+                save_state_to_disk()
+
+                await sio.emit('server_log', {'type': 'SUCCESS', 'msg': f'🔥 Чистый MP4 готов! Запускаю {media_title}'}, to=sid)
                 await sio.emit('player_command', {
                     'action': 'update_playlist', 
-                    'playlist': yt_playlist, 
+                    'playlist': playlist, 
                     'currentIndex': 0,
-                    'media_title': yt_title
+                    'media_title': media_title
                 })
                 await sio.emit('player_command', {
                     'action': 'load_video', 
-                    'url': yt_stream_url
+                    'url': first_mp4
                 })
                 return
-        except Exception as yt_err:
-            await sio.emit('server_log', {'type': 'ERROR', 'msg': 'Ошибка YouTube!', 'details': str(yt_err)}, to=sid)
+        except Exception as e:
+            await sio.emit('server_log', {'type': 'ERROR', 'msg': f'Ошибка парсинга Anwap: {e}'}, to=sid)
             return
 
-    # 2. KINOVIBE И KINOGO / COLLAPS ССЫЛКИ
+    # 3. 🌐 KINOVIBE (СТАНДАРТ)
     try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Referer": "https://kinovibe.cc/" if "kinovibe" in url else "https://mov.kinogo1.biz/"
-        }
-
+        headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://kinovibe.cc/"}
         async with ClientSession(headers=headers, cookies=kv_cookies) as session:
             async with session.get(url, timeout=12) as resp:
                 html = await resp.text()
                 media_title = extract_clean_title(html)
 
-                # --- ПРОВЕРКА НА KINOGO / COLLAPS BALANCER ---
-                iframe_match = re.search(r'<iframe[^>]+src=["\']([^"\']+)["\']', html, re.IGNORECASE)
-                if "ortified.ws" in url or "collaps" in url or (iframe_match and ("ortified.ws" in iframe_match.group(1) or "collaps" in iframe_match.group(1))):
-                    embed_url = url if ("ortified.ws" in url or "collaps" in url) else iframe_match.group(1)
-                    if embed_url.startswith('//'): embed_url = 'https:' + embed_url
-                    elif embed_url.startswith('/'): embed_url = urljoin(url, embed_url)
-
-                    await sio.emit('server_log', {'type': 'INFO', 'msg': 'Найден плеер Kinogo/Collaps! Сканирую серии...', 'details': embed_url}, to=sid)
-                    playlist = await parse_collaps_embed(session, embed_url, url)
-
-                    if playlist:
-                        room_state["playlist"] = playlist
-                        room_state["current_ep_index"] = 0
-                        room_state["mode"] = "video"
-                        room_state["current_url"] = playlist[0]["url"]
-                        room_state["media_title"] = media_title or "Винченцо"
-
-                        save_state_to_disk()
-
-                        await sio.emit('server_log', {'type': 'SUCCESS', 'msg': f'Найдено серий Kinogo: {len(playlist)}!', 'details': f'Запускаю: {room_state["media_title"]}'}, to=sid)
-                        await sio.emit('player_command', {
-                            'action': 'update_playlist', 
-                            'playlist': playlist, 
-                            'currentIndex': 0,
-                            'media_title': room_state["media_title"]
-                        })
-                        await sio.emit('player_command', {
-                            'action': 'load_video', 
-                            'url': playlist[0]["url"]
-                        })
-                        return
-
-                # --- СТАНДАРТНАЯ ЛОГИКА KINOVIBE (Playerjs) ---
                 match_file = re.search(r'file\s*:\s*["\']([^"\'\s]+)["\']', html, re.IGNORECASE)
                 if match_file:
                     found_path = match_file.group(1).strip()
-                    
                     if ".txt" in found_path or ".json" in found_path:
                         pl_url = found_path if found_path.startswith('http') else ("https:" + found_path if found_path.startswith('//') else "https://kinovibe.cc" + (found_path if found_path.startswith('/') else '/' + found_path))
-                        
-                        await sio.emit('server_log', {'type': 'SUCCESS', 'msg': 'Найден плейлист Kinovibe!', 'details': pl_url}, to=sid)
                         playlist = await fetch_playerjs_playlist(session, pl_url)
-                        
                         if playlist:
                             room_state["playlist"] = playlist
                             room_state["current_ep_index"] = 0
                             room_state["mode"] = "video"
                             room_state["current_url"] = playlist[0]["url"]
                             room_state["media_title"] = media_title
-                            
                             save_state_to_disk()
-                            
-                            await sio.emit('server_log', {'type': 'SUCCESS', 'msg': f'Загружено серий: {len(playlist)}!', 'details': f'Запускаю: {media_title}'}, to=sid)
-                            await sio.emit('player_command', {
-                                'action': 'update_playlist', 
-                                'playlist': playlist, 
-                                'currentIndex': 0,
-                                'media_title': media_title
-                            })
-                            await sio.emit('player_command', {
-                                'action': 'load_video', 
-                                'url': playlist[0]["url"]
-                            })
+                            await sio.emit('player_command', {'action': 'update_playlist', 'playlist': playlist, 'currentIndex': 0, 'media_title': media_title})
+                            await sio.emit('player_command', {'action': 'load_video', 'url': playlist[0]["url"]})
                             return
-
                     elif ".mp4" in found_path or ".m3u8" in found_path:
                         movie_url = found_path if found_path.startswith('http') else ("https:" + found_path if found_path.startswith('//') else "https://kinovibe.cc" + (found_path if found_path.startswith('/') else '/' + found_path))
-                        
                         movie_playlist = [{"title": "Фильм (Смотреть)", "url": movie_url}]
                         room_state["playlist"] = movie_playlist
                         room_state["current_ep_index"] = 0
                         room_state["mode"] = "video"
                         room_state["current_url"] = movie_url
                         room_state["media_title"] = media_title
-                        
                         save_state_to_disk()
-                        
-                        await sio.emit('server_log', {'type': 'SUCCESS', 'msg': f'Найден Фильм: {media_title}', 'details': movie_url}, to=sid)
-                        await sio.emit('player_command', {
-                            'action': 'update_playlist', 
-                            'playlist': movie_playlist, 
-                            'currentIndex': 0,
-                            'media_title': media_title
-                        })
-                        await sio.emit('player_command', {
-                            'action': 'load_video', 
-                            'url': movie_url
-                        })
+                        await sio.emit('player_command', {'action': 'update_playlist', 'playlist': movie_playlist, 'currentIndex': 0, 'media_title': media_title})
+                        await sio.emit('player_command', {'action': 'load_video', 'url': movie_url})
                         return
 
                 await sio.emit('server_log', {'type': 'ERROR', 'msg': 'Медиапоток не найден на странице', 'details': 'Проверь ссылку.'}, to=sid)
-
     except Exception as e:
         await sio.emit('server_log', {'type': 'ERROR', 'msg': 'Ошибка сервера!', 'details': str(e)}, to=sid)
 
